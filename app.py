@@ -23,7 +23,7 @@ st.set_page_config(
 
 
 # -----------------------------------------------------------------------------
-# Data Loading & Caching
+# Data Loading & Caching (Memory-Safe Chunked Loading)
 # -----------------------------------------------------------------------------
 @st.cache_data(show_spinner="Downloading and loading CORD-19 metadata...")
 def load_data() -> pd.DataFrame:
@@ -57,19 +57,59 @@ def load_data() -> pd.DataFrame:
         "journal",
         "source_x",
     ]
-    df = pd.read_csv(path, usecols=cols, low_memory=False)
 
-    df["publish_time"] = pd.to_datetime(df["publish_time"], errors="coerce")
-    df["year"] = df["publish_time"].dt.year
-    df["month"] = df["publish_time"].dt.to_period("M").dt.to_timestamp()
+    chunks = []
+    rows_collected = 0
+    max_rows = 100_000
 
-    df = df.dropna(subset=["title", "year"])
-    df = df[(df["year"] >= 1990) & (df["year"] <= 2023)]
+    for chunk in pd.read_csv(
+        path, usecols=cols, chunksize=50_000, low_memory=False
+    ):
+        chunk["publish_time"] = pd.to_datetime(
+            chunk["publish_time"], errors="coerce"
+        )
+        chunk["year"] = chunk["publish_time"].dt.year
+        chunk = chunk.dropna(subset=["title", "year"])
+        chunk = chunk[(chunk["year"] >= 2020) & (chunk["year"] <= 2023)]
+        if chunk.empty:
+            continue
 
-    df["source_x"] = df["source_x"].fillna("Unknown")
-    df["journal"] = df["journal"].fillna("Unknown")
-    df["has_abstract"] = df["abstract"].notna()
-    df["abstract_words"] = df["abstract"].fillna("").str.split().str.len()
+        chunk["month"] = (
+            chunk["publish_time"].dt.to_period("M").dt.to_timestamp()
+        )
+        chunk["source_x"] = chunk["source_x"].fillna("Unknown")
+        chunk["journal"] = chunk["journal"].fillna("Unknown")
+        chunk["has_abstract"] = chunk["abstract"].notna()
+        chunk["abstract_words"] = (
+            chunk["abstract"].fillna("").str.split().str.len()
+        )
+
+        # Drop full abstract and publish_time columns to reduce memory usage
+        chunk = chunk.drop(columns=["abstract", "publish_time"])
+        chunks.append(chunk)
+        rows_collected += len(chunk)
+
+        if rows_collected >= max_rows:
+            break
+
+    expected_cols = [
+        "cord_uid",
+        "title",
+        "authors",
+        "journal",
+        "source_x",
+        "year",
+        "month",
+        "has_abstract",
+        "abstract_words",
+    ]
+
+    if not chunks:
+        return pd.DataFrame(columns=expected_cols)
+
+    df = pd.concat(chunks, ignore_index=True)
+    if len(df) > max_rows:
+        df = df.sample(max_rows, random_state=42).reset_index(drop=True)
 
     return df
 
@@ -92,15 +132,20 @@ def main():
         )
         st.stop()
 
+    if df.empty:
+        st.warning("No papers loaded for the selected date range.")
+        st.stop()
+
     # --- Sidebar Filters ---
     st.sidebar.header("Filters")
 
     min_year, max_year = int(df["year"].min()), int(df["year"].max())
+    default_start = max(min_year, 2020)
     year_range = st.sidebar.slider(
         "Publication Years",
         min_value=min_year,
         max_value=max_year,
-        value=(2019, max_year),
+        value=(default_start, max_year),
     )
 
     sources = ["All"] + sorted(df["source_x"].unique().tolist())
@@ -126,12 +171,13 @@ def main():
     ].nunique()
     pct_abs = filtered["has_abstract"].mean() * 100
     avg_words = filtered.loc[filtered["has_abstract"], "abstract_words"].mean()
+    avg_words_display = f"{avg_words:.0f} words" if pd.notna(avg_words) else "N/A"
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("📄 Papers", f"{n_papers:,}")
     col2.metric("📚 Journals", f"{n_journals:,}")
     col3.metric("📝 Have Abstract", f"{pct_abs:.0f}%")
-    col4.metric("✍️ Avg Abstract Length", f"{avg_words:.0f} words")
+    col4.metric("✍️ Avg Abstract Length", avg_words_display)
 
     st.divider()
 
@@ -216,20 +262,20 @@ def main():
     # --- 6. Word Cloud of Titles ---
     st.subheader("Most Common Words in Titles")
     sample_titles = filtered["title"].sample(
-        min(len(filtered), 20000), random_state=1
+        min(len(filtered), 2500), random_state=1
     )
-    text = " ".join(sample_titles)
+    text = " ".join(sample_titles.astype(str))
     stopwords = STOPWORDS.union(
         {"covid", "covid-19", "sars", "cov", "2", "study", "using"}
     )
     wc = WordCloud(
-        width=1200,
-        height=450,
+        width=800,
+        height=300,
         background_color="white",
         stopwords=stopwords,
     ).generate(text)
 
-    fig_wc, ax = plt.subplots(figsize=(12, 4.5))
+    fig_wc, ax = plt.subplots(figsize=(9, 3.5))
     ax.imshow(wc, interpolation="bilinear")
     ax.axis("off")
     st.pyplot(fig_wc)
